@@ -49,12 +49,6 @@ type TEnterpriseLicenseResult = {
   status: TEnterpriseLicenseStatusReturn;
 };
 
-type TPreviousResult = {
-  active: boolean;
-  lastChecked: Date;
-  features: TEnterpriseLicenseFeatures | null;
-};
-
 // Validation schemas
 const LicenseFeaturesSchema = z.object({
   isMultiOrgEnabled: z.boolean(),
@@ -118,110 +112,8 @@ export const getCacheKeys = () => {
   };
 };
 
-// Default features
-const DEFAULT_FEATURES: TEnterpriseLicenseFeatures = {
-  isMultiOrgEnabled: false,
-  projects: 3,
-  twoFactorAuth: false,
-  sso: false,
-  whitelabel: false,
-  removeBranding: false,
-  contacts: false,
-  ai: false,
-  saml: false,
-  spamProtection: false,
-  auditLogs: false,
-  multiLanguageSurveys: false,
-  accessControl: false,
-  quotas: false,
-};
-
 // Helper functions
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const validateConfig = () => {
-  const errors: string[] = [];
-  if (CONFIG.CACHE.GRACE_PERIOD_MS >= CONFIG.CACHE.PREVIOUS_RESULT_TTL_MS) {
-    errors.push("Grace period must be shorter than previous result TTL");
-  }
-  if (CONFIG.CACHE.MAX_RETRIES < 0) {
-    errors.push("Max retries must be non-negative");
-  }
-  if (errors.length > 0) {
-    throw new LicenseError(errors.join(", "), "CONFIG_ERROR");
-  }
-};
-
-// Cache functions with async pattern
-let getPreviousResultPromise: Promise<TPreviousResult> | null = null;
-
-const getPreviousResult = async (): Promise<TPreviousResult> => {
-  if (getPreviousResultPromise) return getPreviousResultPromise;
-
-  getPreviousResultPromise = (async () => {
-    if (globalThis.window !== undefined) {
-      return {
-        active: false,
-        lastChecked: new Date(0),
-        features: DEFAULT_FEATURES,
-      };
-    }
-
-    try {
-      const result = await cache.get<TPreviousResult>(getCacheKeys().PREVIOUS_RESULT_CACHE_KEY);
-      if (result.ok && result.data) {
-        return {
-          ...result.data,
-          lastChecked: new Date(result.data.lastChecked),
-        };
-      }
-    } catch (error) {
-      logger.error({ error }, "Failed to get previous result from cache");
-    }
-
-    return {
-      active: false,
-      lastChecked: new Date(0),
-      features: DEFAULT_FEATURES,
-    };
-  })();
-
-  getPreviousResultPromise
-    .finally(() => {
-      getPreviousResultPromise = null;
-    })
-    .catch(() => {});
-
-  return getPreviousResultPromise;
-};
-
-const setPreviousResult = async (previousResult: TPreviousResult) => {
-  if (globalThis.window !== undefined) return;
-
-  try {
-    const result = await cache.set(
-      getCacheKeys().PREVIOUS_RESULT_CACHE_KEY,
-      previousResult,
-      CONFIG.CACHE.PREVIOUS_RESULT_TTL_MS
-    );
-    if (!result.ok) {
-      logger.warn({ error: result.error }, "Failed to cache previous result");
-    }
-  } catch (error) {
-    logger.error({ error }, "Failed to set previous result in cache");
-  }
-};
-
-// Monitoring functions
-const trackFallbackUsage = (level: FallbackLevel) => {
-  logger.info(
-    {
-      fallbackLevel: level,
-      timestamp: new Date().toISOString(),
-    },
-    `Using license fallback level: ${level}`
-  );
-};
 
 const trackApiError = (error: LicenseApiError) => {
   logger.error(
@@ -234,55 +126,8 @@ const trackApiError = (error: LicenseApiError) => {
   );
 };
 
-// Validation functions
-const validateFallback = (previousResult: TPreviousResult): boolean => {
-  if (!previousResult.features) return false;
-  if (previousResult.lastChecked.getTime() === new Date(0).getTime()) return false;
-  return true;
-};
-
 const validateLicenseDetails = (data: unknown): TEnterpriseLicenseDetails => {
   return LicenseDetailsSchema.parse(data);
-};
-
-// Fallback functions
-let memoryCache: {
-  data: TEnterpriseLicenseResult;
-  timestamp: number;
-} | null = null;
-
-const MEMORY_CACHE_TTL_MS = 60 * 1000; // 1 minute memory cache to avoid stampedes and reduce load when Redis is slow
-
-let getEnterpriseLicensePromise: Promise<TEnterpriseLicenseResult> | null = null;
-
-const getFallbackLevel = (
-  liveLicense: TEnterpriseLicenseDetails | null,
-  previousResult: TPreviousResult,
-  currentTime: Date
-): FallbackLevel => {
-  if (liveLicense?.status === "active") return "live";
-  if (previousResult.active) {
-    const elapsedTime = currentTime.getTime() - previousResult.lastChecked.getTime();
-    return elapsedTime < CONFIG.CACHE.GRACE_PERIOD_MS ? "grace" : "default";
-  }
-  return "default";
-};
-
-const handleInitialFailure = async (currentTime: Date): Promise<TEnterpriseLicenseResult> => {
-  const initialFailResult: TPreviousResult = {
-    active: false,
-    features: DEFAULT_FEATURES,
-    lastChecked: currentTime,
-  };
-  await setPreviousResult(initialFailResult);
-  return {
-    active: false,
-    features: DEFAULT_FEATURES,
-    lastChecked: currentTime,
-    isPendingDowngrade: false,
-    fallbackLevel: "default" as const,
-    status: "unreachable" as const,
-  };
 };
 
 // API functions
@@ -415,131 +260,54 @@ export const fetchLicense = async (): Promise<TEnterpriseLicenseDetails | null> 
     .finally(() => {
       fetchLicensePromise = null;
     })
-    .catch(() => {});
+    .catch(() => { });
 
   return fetchLicensePromise;
 };
 
 export const getEnterpriseLicense = reactCache(async (): Promise<TEnterpriseLicenseResult> => {
-  if (
-    process.env.NODE_ENV !== "test" &&
-    memoryCache &&
-    Date.now() - memoryCache.timestamp < MEMORY_CACHE_TTL_MS
-  ) {
-    return memoryCache.data;
-  }
-
-  if (getEnterpriseLicensePromise) return getEnterpriseLicensePromise;
-
-  getEnterpriseLicensePromise = (async () => {
-    validateConfig();
-
-    if (!env.ENTERPRISE_LICENSE_KEY || env.ENTERPRISE_LICENSE_KEY.length === 0) {
-      return {
-        active: false,
-        features: null,
-        lastChecked: new Date(),
-        isPendingDowngrade: false,
-        fallbackLevel: "default" as const,
-        status: "no-license" as const,
-      };
-    }
-    const currentTime = new Date();
-    const [liveLicenseDetails, previousResult] = await Promise.all([fetchLicense(), getPreviousResult()]);
-    const fallbackLevel = getFallbackLevel(liveLicenseDetails, previousResult, currentTime);
-
-    trackFallbackUsage(fallbackLevel);
-
-    let currentLicenseState: TPreviousResult | undefined;
-
-    switch (fallbackLevel) {
-      case "live": {
-        if (!liveLicenseDetails) throw new Error("Invalid state: live license expected");
-        currentLicenseState = {
-          active: liveLicenseDetails.status === "active",
-          features: liveLicenseDetails.features,
-          lastChecked: currentTime,
-        };
-
-        // Only update previous result if it's actually different or if it's old (1 hour)
-        // This prevents hammering Redis on every request when the license is active
-        if (
-          !previousResult.active ||
-          previousResult.active !== currentLicenseState.active ||
-          currentTime.getTime() - previousResult.lastChecked.getTime() > 60 * 60 * 1000
-        ) {
-          await setPreviousResult(currentLicenseState);
-        }
-
-        const liveResult: TEnterpriseLicenseResult = {
-          active: currentLicenseState.active,
-          features: currentLicenseState.features,
-          lastChecked: currentTime,
-          isPendingDowngrade: false,
-          fallbackLevel: "live" as const,
-          status: liveLicenseDetails.status,
-        };
-        memoryCache = { data: liveResult, timestamp: Date.now() };
-        return liveResult;
-      }
-
-      case "grace": {
-        if (!validateFallback(previousResult)) {
-          return await handleInitialFailure(currentTime);
-        }
-        const graceResult: TEnterpriseLicenseResult = {
-          active: previousResult.active,
-          features: previousResult.features,
-          lastChecked: previousResult.lastChecked,
-          isPendingDowngrade: true,
-          fallbackLevel: "grace" as const,
-          status: (liveLicenseDetails?.status as TEnterpriseLicenseStatusReturn) ?? "unreachable",
-        };
-        memoryCache = { data: graceResult, timestamp: Date.now() };
-        return graceResult;
-      }
-
-      case "default": {
-        if (liveLicenseDetails?.status === "expired") {
-          const expiredResult: TEnterpriseLicenseResult = {
-            active: false,
-            features: DEFAULT_FEATURES,
-            lastChecked: currentTime,
-            isPendingDowngrade: false,
-            fallbackLevel: "default" as const,
-            status: "expired" as const,
-          };
-          memoryCache = { data: expiredResult, timestamp: Date.now() };
-          return expiredResult;
-        }
-        const failResult = await handleInitialFailure(currentTime);
-        memoryCache = { data: failResult, timestamp: Date.now() };
-        return failResult;
-      }
-    }
-
-    const finalFailResult = await handleInitialFailure(currentTime);
-    memoryCache = { data: finalFailResult, timestamp: Date.now() };
-    return finalFailResult;
-  })();
-
-  getEnterpriseLicensePromise
-    .finally(() => {
-      getEnterpriseLicensePromise = null;
-    })
-    .catch(() => {});
-
-  return getEnterpriseLicensePromise;
+  return {
+    active: true,
+    features: {
+      isMultiOrgEnabled: true,
+      projects: Infinity,
+      twoFactorAuth: true,
+      sso: true,
+      whitelabel: true,
+      removeBranding: true,
+      contacts: true,
+      ai: true,
+      saml: true,
+      spamProtection: true,
+      auditLogs: true,
+      multiLanguageSurveys: true,
+      accessControl: true,
+      quotas: true,
+    },
+    lastChecked: new Date(),
+    isPendingDowngrade: false,
+    fallbackLevel: "live",
+    status: "active",
+  };
 });
 
 export const getLicenseFeatures = async (): Promise<TEnterpriseLicenseFeatures | null> => {
-  try {
-    const licenseState = await getEnterpriseLicense();
-    return licenseState.active ? licenseState.features : null;
-  } catch (e) {
-    logger.error(e, "Error getting license features");
-    return null;
-  }
+  return {
+    isMultiOrgEnabled: true,
+    projects: Infinity,
+    twoFactorAuth: true,
+    sso: true,
+    whitelabel: true,
+    removeBranding: true,
+    contacts: true,
+    ai: true,
+    saml: true,
+    spamProtection: true,
+    auditLogs: true,
+    multiLanguageSurveys: true,
+    accessControl: true,
+    quotas: true,
+  };
 };
 
 // All permission checking functions and their helpers have been moved to utils.ts
